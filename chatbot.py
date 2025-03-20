@@ -163,30 +163,25 @@ text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=20
 splits = text_splitter.create_documents([web_content])
 print(f"Created {len(splits)} document chunks.")
 
-chroma_config = {
-    'index_name': 'knowledge_base',
-    'vector_search_params': {
-        'limit': 5,
-        'filter_threshold': 0.75,
-        'include_metadata': True
-    },
-    'retrieval': {
-        'knn': True,
-        'exact_search': False
-    }
-}
-
 # Initialize embeddings and vector store with persistent storage
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 persist_directory = "./vector_db"
 vectorstore = Chroma.from_documents(
     documents=splits,
     embedding=embeddings,
-    persist_directory=persist_directory,
-    config=chroma_config
+    persist_directory=persist_directory
 )
 
+vectorstore.vector_search_params = {
+    'limit': 5,
+    'filter_threshold': 0.75,
+    'include_metadata': True
+}
 
+vectorstore.retrieval = {
+    'knn': True,
+    'exact_search': False
+}
 # Create a retriever from the vector store
 retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
