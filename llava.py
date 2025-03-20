@@ -67,7 +67,7 @@ def call_llava(image_path, question):
         b64_img = base64.b64encode(f.read()).decode("utf-8")
     prompt = f"Image (base64): {b64_img}\nQuestion: {question}"
     response = ollama.chat(
-        model='llava',
+        model='llava:7b',
         messages=[{'role': 'user', 'content': prompt}],
     )
     return response['message']['content']
