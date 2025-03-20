@@ -59,20 +59,22 @@ def ollama_llm(question, context):
         model='llama3.1:8b',
         messages=[{'role': 'user', 'content': formatted_prompt}],
         tools=[call_llava_tool],
+        stream=True
     )
     return response
 
 # Function calling for image processing.
 def call_llava(image_path, question):
-    with open(image_path, "rb") as f:
-        b64_img = base64.b64encode(f.read()).decode("utf-8")
-    prompt = f"Image (base64): {b64_img}\nQuestion: {question}"
+  #  with open(image_path, "rb") as f:
+ #       b64_img = base64.b64encode(f.read()).decode("utf-8")
+#    prompt = f"Image (base64): {b64_img}\nQuestion: {question}"
 #    print(prompt)
     response = ollama.chat(
-        model='llava:7b',
+        model='llava:13b',
         messages=[{'role': 'user', 'content': question, 'images': [image_path]}],
+        stream=True
     )
-    return response['message']['content']
+    return response
 
 # Manual tool definition for image processing.
 call_llava_tool = {
@@ -113,6 +115,9 @@ def chat_with_bot():
         if user_input.lower() == "quit":
             break
         response = rag_chain(user_input.strip())
-        print(response)
+#        print(response)
+        for chunk in response:
+            assistant_response += chunk['message']['content']
+            print(chunk['message']['content'], end='', flush=True)
 
 chat_with_bot()
