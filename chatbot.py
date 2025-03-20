@@ -137,7 +137,7 @@ import re
 import trafilatura
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings
 
 # Set a similarity threshold
 SIMILARITY_THRESHOLD = 0.4
@@ -171,8 +171,7 @@ vectorstore = Chroma.from_documents(
     embedding=embeddings,
     persist_directory=persist_directory
 )
-vectorstore.persist()
-print("Vector store initialized and persisted.")
+
 
 # Create a retriever from the vector store
 retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
@@ -181,6 +180,7 @@ def combine_docs(docs):
     # Combine document texts into one context string
     return " ".join([re.sub(r'\n+', ' ', doc.page_content).strip() for doc in docs])
 
+'''
 def retrieve_relevant_context(query):
     # Use retriever's similarity search with score if available
     try:
@@ -195,6 +195,18 @@ def retrieve_relevant_context(query):
     if not filtered_docs:
         return ""
     return combine_docs(filtered_docs)
+'''
+def retrieve_relevant_context(query):
+    try:
+        results = vectorstore.similarity_search(query, k=3)  # Retrieve without scores
+    except Exception as e:
+        print("Error during similarity search:", e)
+        return ""
+
+    if not results:
+        return ""
+
+    return combine_docs(results)
 
 def ollama_llm(question, context):
     if not context:
