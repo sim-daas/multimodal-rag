@@ -166,8 +166,7 @@ print(f"Created {len(splits)} document chunks.")
 # Initialize embeddings and vector store with persistent storage
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 persist_directory = "./vector_db"
-vectorstore = Chroma.from_documents(
-    documents=splits,
+vectorstore = Chroma(
     embedding=embeddings,
     persist_directory=persist_directory
 )
