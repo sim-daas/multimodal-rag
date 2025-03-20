@@ -21,7 +21,7 @@ embeddings = OllamaEmbeddings(model="nomic-embed-text")
 persist_directory = "./vector_db"
 vectorstore = Chroma(
 #    documents=splits,
-    embedding=embeddings,
+    embedding_function=embeddings,
     persist_directory=persist_directory
 )
 
@@ -32,7 +32,7 @@ vectorstore.vector_search_params = {
 }
 
 vectorstore.retrieval = {
-    'knn': True,
+    'knn': False,
     'exact_search': False
 }
 
@@ -146,6 +146,11 @@ def get_web_context(query):
         web_context += f"Source: {search_results[0]['url']}\n{content}\n"
     
     return web_context
+
+def combine_docs(docs):
+    # Combine document texts into one context string
+    return " ".join([re.sub(r'\n+', ' ', doc.page_content).strip() for doc in docs])
+
 
 # --- Existing functions with web search integration ---
 def scrape_webpage(url):
