@@ -32,10 +32,10 @@ vectorstore.vector_search_params = {
 }
 
 vectorstore.retrieval = {
-    'knn': False,
-    'exact_search': False
+    'knn': True,
+    'exact_search': False,
+    'rerank': True  # Enables semantic ranking
 }
-
 
 # --- Web Search Functions ---
 def search_duckduckgo(query, num_results=3):
