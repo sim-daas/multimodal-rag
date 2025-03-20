@@ -319,7 +319,7 @@ class RagChatbot:
             logger.info(f"Retrieved local context: {local_context[:100]}...")
 
         # Get web context if web search is enabled and needed
-        if self.web_search_enabled and self.websearch.should_search_web(query, local_context):
+        if self.web_search_enabled:
             logger.info("Searching the web...")
             web_context = self.websearch.get_web_context(query)
             logger.info(f"Retrieved web context: {web_context[:100]}...")
