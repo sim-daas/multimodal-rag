@@ -107,7 +107,7 @@ def rag_chain(question):
     print(formatted_context)
     return ollama_llm(question, formatted_context)
 
-demo_question = "What is qwq ?"
+demo_question = "Who is usa president ?"
 result = rag_chain(demo_question)
 print("Demo Question:", demo_question)
 for chunk in result:
