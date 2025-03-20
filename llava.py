@@ -54,6 +54,7 @@ def retrieve_relevant_context(query):
 
 def ollama_llm(question, context):
     formatted_prompt = f"Question: {question}\n\nContext: {context}"
+    print(context)
     response = ollama.chat(
         model='llama3.1:8b',
         messages=[{'role': 'user', 'content': formatted_prompt}],
@@ -66,6 +67,7 @@ def call_llava(image_path, question):
     with open(image_path, "rb") as f:
         b64_img = base64.b64encode(f.read()).decode("utf-8")
     prompt = f"Image (base64): {b64_img}\nQuestion: {question}"
+    print(prompt)
     response = ollama.chat(
         model='llava:7b',
         messages=[{'role': 'user', 'content': prompt}],
