@@ -75,7 +75,7 @@ def scrape_webpage(url):
     cleaned_text = re.sub(r'\n+', '\n', extracted).strip() if extracted else ""
     return cleaned_text
 
-url = "https://docs.ultralytics.com/models/yolo12/"
+url = "https://qwenlm.github.io/blog/qwq-32b/"
 web_content = scrape_webpage(url)
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -107,7 +107,7 @@ def rag_chain(question):
     print(formatted_context)
     return ollama_llm(question, formatted_context)
 
-demo_question = "What is yolov12 ?"
+demo_question = "What is qwq ?"
 result = rag_chain(demo_question)
 print("Demo Question:", demo_question)
 for chunk in result:
