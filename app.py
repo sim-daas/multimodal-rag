@@ -1,5 +1,4 @@
-
-
+'''
 import ollama
 import trafilatura
 import re
@@ -64,7 +63,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
 
 # Set a similarity threshold
-SIMILARITY_THRESHOLD = 0.9  # Adjust based on testing
+SIMILARITY_THRESHOLD = 0.6  # Adjust based on testing
 
 def scrape_webpage(url):
     downloaded = trafilatura.fetch_url(url)
@@ -116,6 +115,3 @@ result = rag_chain(demo_question)
 print("\nDemo Question:", demo_question)
 for chunk in result:
     print(chunk['message']['content'], end='', flush=True)
-
-
-'''
