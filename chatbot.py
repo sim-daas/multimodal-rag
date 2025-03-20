@@ -1,5 +1,4 @@
-#!/root/miniconda2/envs/aagent/bin/python
-
+'''
 import os
 import ollama
 import re
@@ -128,3 +127,173 @@ def chat_with_bot():
 
 # Run the chatbot
 chat_with_bot()
+
+'''
+#!/root/miniconda2/envs/aagent/bin/python
+
+import os
+import ollama
+import re
+import trafilatura
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OllamaEmbeddings
+
+# Set a similarity threshold
+SIMILARITY_THRESHOLD = 0.4
+
+def scrape_webpage(url):
+    downloaded = trafilatura.fetch_url(url)
+    if downloaded is None:
+        raise Exception(f"Failed to fetch {url}")
+    extracted = trafilatura.extract(downloaded, include_comments=False, include_formatting=False)
+    if not extracted:
+        raise Exception("Failed to extract text from the page.")
+    # Remove extraneous whitespace
+    cleaned_text = re.sub(r'\n+', '\n', extracted).strip()
+    return cleaned_text
+
+# URL to scrape (web-based)
+url = "https://docs.ultralytics.com/models/yolo12/"
+web_content = scrape_webpage(url)
+print("Web content fetched.")
+
+# Split the content into chunks
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+splits = text_splitter.create_documents([web_content])
+print(f"Created {len(splits)} document chunks.")
+
+# Initialize embeddings and vector store with persistent storage
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+persist_directory = "./vector_db"
+vectorstore = Chroma.from_documents(
+    documents=splits,
+    embedding=embeddings,
+    persist_directory=persist_directory
+)
+vectorstore.persist()
+print("Vector store initialized and persisted.")
+
+# Create a retriever from the vector store
+retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+
+def combine_docs(docs):
+    # Combine document texts into one context string
+    return " ".join([re.sub(r'\n+', ' ', doc.page_content).strip() for doc in docs])
+
+def retrieve_relevant_context(query):
+    # Use retriever's similarity search with score if available
+    try:
+        results = retriever.similarity_search_with_score(query, k=3)
+    except Exception as e:
+        print("Error during similarity_search_with_score:", e)
+        # Fallback to simple invoke if necessary
+        results = [(doc, 1.0) for doc in retriever.invoke(query)]
+    
+    # Filter based on threshold
+    filtered_docs = [doc for doc, score in results if score > SIMILARITY_THRESHOLD]
+    if not filtered_docs:
+        return ""
+    return combine_docs(filtered_docs)
+
+def ollama_llm(question, context):
+    if not context:
+        context = "No relevant information found in the knowledge base."
+    formatted_prompt = f"Question: {question}\n\nContext: {context}"
+    try:
+        response = ollama.chat(
+            model='deepseek-r1:8b',
+            messages=[{'role': 'user', 'content': formatted_prompt}],
+            stream=True
+        )
+    except Exception as e:
+        print("Error during Ollama chat:", e)
+        return iter([{'message': {'content': "Error contacting LLM."}}])
+    return response
+
+def rag_chain(question):
+    context = retrieve_relevant_context(question)
+    print("Retrieved context:", context)
+    return ollama_llm(question, context)
+
+# --- Conversation saving/loading functions ---
+def list_saved_conversations():
+    chats_dir = "chats"
+    if not os.path.exists(chats_dir):
+        os.makedirs(chats_dir)
+    return [f for f in os.listdir(chats_dir) if f.endswith('.txt')]
+
+def load_conversation(file_name):
+    chats_dir = "chats"
+    file_path = os.path.join(chats_dir, file_name)
+    conversation_history = []
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+    current_role, current_message = "", ""
+    for line in lines:
+        if line.startswith("user:") or line.startswith("assistant:"):
+            if current_message:
+                conversation_history.append({"role": current_role, "content": current_message.strip()})
+            current_role = line.split(":")[0]
+            current_message = line.split(":", 1)[1].strip()
+        else:
+            current_message += " " + line.strip()
+    if current_message:
+        conversation_history.append({"role": current_role, "content": current_message.strip()})
+    return conversation_history
+
+def save_conversation(conversation_history, file_name):
+    chats_dir = "chats"
+    if not os.path.exists(chats_dir):
+        os.makedirs(chats_dir)
+    file_path = os.path.join(chats_dir, f"{file_name}.txt")
+    with open(file_path, 'w') as file:
+        for message in conversation_history:
+            file.write(f"{message['role']}: {message['content']}\n")
+
+# --- Main chatbot loop ---
+def chat_with_bot():
+    conversation_history = [{"role": "system", "content": "You are a helpful AI assistant."}]
+    
+    saved_conversations = list_saved_conversations()
+    if saved_conversations:
+        print("Saved conversations:")
+        for i, conv in enumerate(saved_conversations):
+            print(f"{i+1}. {conv}")
+        option = input("Load saved conversation or start new? (load/new): ")
+        if option.lower() == "load":
+            idx = int(input("Enter the number to load: ")) - 1
+            conversation_history = load_conversation(saved_conversations[idx])
+        else:
+            print("Starting new conversation.")
+
+
+    while True:
+        user_input = ""
+        while True:
+            line = input("> ")
+            if line == ",,,":
+                break
+            if line == "quit":
+                user_input = "quit"
+                break
+            user_input += line + "\n"
+        if user_input.lower() == "quit":
+            break
+
+        conversation_history.append({"role": "user", "content": user_input.strip()})
+        response_iterator = rag_chain(user_input.strip())
+        assistant_response = ""
+        for chunk in response_iterator:
+            assistant_response += chunk['message']['content']
+            print(chunk['message']['content'], end='', flush=True)
+        conversation_history.append({"role": "assistant", "content": assistant_response.strip()})
+
+    save_opt = input("Save this conversation? (yes/no): ")
+    if save_opt.lower() == "yes":
+        file_name = input("Enter conversation file name: ").strip()
+        if file_name:
+            save_conversation(conversation_history, file_name)
+
+chat_with_bot()
+
