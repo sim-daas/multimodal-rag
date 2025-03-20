@@ -76,11 +76,11 @@ def scrape_webpage(url):
     response = requests.get(url)
     if response.status_code == 200:
         soup = bs4.BeautifulSoup(response.text, "html.parser")
-        for script in soup(["script", "style", "img", "table"]):
-            script.extract()
-        text = soup.get_text()
-        text = re.sub(r'\n+', '\n', text).strip()
-        return text
+        for tag in soup(['script', 'style', 'img', 'table']):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+        cleaned_text = re.sub(r'\n+', '\n', text)
+        return cleaned_text
     else:
         raise Exception(f"Failed to fetch {url} - Status Code: {response.status_code}")
 
@@ -103,7 +103,7 @@ vectorstore.persist()
 retriever = vectorstore.as_retriever()
 
 def combine_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    return " ".join([re.sub(r'\n+', ' ', doc.page_content).strip() for doc in docs])
 
 def ollama_llm(question, context):
     formatted_prompt = f"Question: {question}\n\nContext: {context}"
@@ -116,9 +116,8 @@ def rag_chain(question):
     print(formatted_context)
     return ollama_llm(question, formatted_context)
 
-demo_question = "What is YOLOv12?"
+demo_question = "What is yolov12 ?"
 result = rag_chain(demo_question)
 print("Demo Question:", demo_question)
 for chunk in result:
-    print(chunk['message']['content'], end='', flush=True)
-
+  print(chunk['message']['content'], end='', flush=True)
