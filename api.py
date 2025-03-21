@@ -62,12 +62,13 @@ class SessionInfo(BaseModel):
     last_active: datetime = Field(..., description="When the session was last used")
     rag_enabled: bool = Field(..., description="Whether RAG retrieval is enabled")
     web_search_enabled: bool = Field(..., description="Whether web search is enabled")
+    image_mode_enabled: bool = Field(False, description="Whether image mode is enabled")
     message_count: int = Field(..., description="Number of messages in the conversation")
 
 class FeatureToggleRequest(BaseModel):
     """Request model for toggling features."""
     session_id: str = Field(..., description="Session ID for the conversation")
-    feature: str = Field(..., description="Feature to toggle: 'rag' or 'websearch'")
+    feature: str = Field(..., description="Feature to toggle: 'rag', 'websearch', or 'image'")
     enabled: bool = Field(..., description="Whether to enable or disable the feature")
 
 class DocumentUploadResponse(BaseModel):
@@ -102,6 +103,15 @@ class AudioTranscriptionResponse(BaseModel):
     error: Optional[str] = Field(None, description="Error message if transcription failed")
     duration: Optional[float] = Field(None, description="Duration of the audio in seconds")
     language: Optional[str] = Field(None, description="Detected language of the audio")
+
+class ImageUploadResponse(BaseModel):
+    """Response after image upload."""
+    success: bool = Field(..., description="Whether the image was successfully processed")
+    image_id: Optional[str] = Field(None, description="Unique ID for the uploaded image")
+    filename: str = Field(..., description="Name of the processed file")
+    description: Optional[str] = Field(None, description="AI-generated description of the image")
+    message: str = Field(..., description="Processing status message")
+    error: Optional[str] = Field(None, description="Error message if processing failed")
 
 # ----- Helper Functions -----
 
@@ -188,6 +198,7 @@ async def list_sessions():
             last_active=session_last_active[session_id],
             rag_enabled=chatbot.rag_enabled,
             web_search_enabled=chatbot.web_search_enabled,
+            image_mode_enabled=chatbot.image_mode_enabled,
             message_count=len([m for m in chatbot.conversation_history if m["role"] != "system"])
         ))
     return result
@@ -208,6 +219,7 @@ async def get_session(session_id: str):
         last_active=session_last_active[session_id],
         rag_enabled=chatbot.rag_enabled,
         web_search_enabled=chatbot.web_search_enabled,
+        image_mode_enabled=chatbot.image_mode_enabled,
         message_count=len([m for m in chatbot.conversation_history if m["role"] != "system"])
     )
 
@@ -228,7 +240,7 @@ async def get_conversation_history(session_id: str):
 
 @app.post("/features/toggle", response_model=dict)
 async def toggle_feature(request: FeatureToggleRequest):
-    """Toggle RAG or web search features."""
+    """Toggle RAG, web search, or image mode features."""
     if request.session_id not in sessions:
         raise HTTPException(
             status_code=404,
@@ -253,10 +265,18 @@ async def toggle_feature(request: FeatureToggleRequest):
             "enabled": chatbot.web_search_enabled,
             "message": f"Web search {'enabled' if request.enabled else 'disabled'}"
         }
+    elif request.feature.lower() == "image":
+        chatbot.image_mode_enabled = request.enabled
+        return {
+            "success": True,
+            "feature": "image",
+            "enabled": chatbot.image_mode_enabled,
+            "message": f"Image mode {'enabled' if request.enabled else 'disabled'}"
+        }
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown feature: {request.feature}. Supported features: 'rag', 'websearch'"
+            detail=f"Unknown feature: {request.feature}. Supported features: 'rag', 'websearch', 'image'"
         )
 
 @app.post("/documents/upload", response_model=DocumentUploadResponse)
@@ -607,6 +627,75 @@ async def audio_chat(
         raise HTTPException(
             status_code=500,
             detail=f"Error processing audio chat: {str(e)}"
+        )
+
+@app.post("/images/upload", response_model=ImageUploadResponse)
+async def upload_image(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """Upload an image to process with the image model."""
+    if session_id not in sessions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session {session_id} not found"
+        )
+    
+    chatbot = sessions[session_id]
+    
+    # Check if file is an image
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        return ImageUploadResponse(
+            success=False,
+            filename=file.filename,
+            message="Uploaded file is not a recognized image format",
+            error="Invalid file type"
+        )
+    
+    # Create a temporary file to save the upload
+    image_id = str(uuid.uuid4())
+    file_extension = os.path.splitext(file.filename)[1]
+    temp_file_path = f"./temp_image_{image_id}{file_extension}"
+    
+    try:
+        # Save the uploaded file
+        contents = await file.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(contents)
+        
+        # Process the image using the ImageProcessor
+        result = chatbot.process_image(temp_file_path, image_id)
+        
+        if not result["success"]:
+            return ImageUploadResponse(
+                success=False,
+                filename=file.filename,
+                message=f"Failed to process image: {result.get('error', 'Unknown error')}",
+                error=result.get("error")
+            )
+        
+        # Schedule cleanup in background (but keep image for the session)
+        # We don't want to delete the image as it's needed for future queries in image mode
+        
+        return ImageUploadResponse(
+            success=True,
+            image_id=image_id,
+            filename=file.filename,
+            description=result.get("description"),
+            message="Image successfully processed and added to conversation context"
+        )
+    except Exception as e:
+        # Clean up temp file on error
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
+        return ImageUploadResponse(
+            success=False,
+            filename=file.filename,
+            message=f"Error processing image: {str(e)}",
+            error=str(e)
         )
 
 # Error handlers
