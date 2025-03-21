@@ -10,6 +10,7 @@ import time
 import logging
 import csv
 import pathlib
+import base64
 from typing import List, Dict, Any, Optional, Iterator, Tuple, Set, Union
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -597,6 +598,108 @@ class AudioProcessor:
             return {"success": False, "error": str(e)}
 
 
+class ImageProcessor:
+    """Processes image files and generates descriptions using LLaVa model."""
+    
+    def __init__(self, model_name: str = 'llava:13b'):
+        """Initialize the image processor with model name."""
+        self.model_name = model_name
+        self.supported_formats = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
+    
+    def is_supported_format(self, filename: str) -> bool:
+        """Check if the file format is supported for image processing."""
+        file_ext = pathlib.Path(filename).suffix.lower()
+        return file_ext in self.supported_formats
+    
+    def encode_image(self, image_path: str) -> Optional[str]:
+        """Encode image to base64 for model processing."""
+        if not os.path.isfile(image_path):
+            logger.error(f"Image not found: {image_path}")
+            return None
+        try:
+            with open(image_path, 'rb') as img_file:
+                return base64.b64encode(img_file.read()).decode('utf-8')
+        except Exception as e:
+            logger.error(f"Error encoding image: {str(e)}")
+            return None
+    
+    def describe_image(self, image_path: str) -> Dict[str, Any]:
+        """Generate a detailed description of an image using LLaVa."""
+        if not os.path.exists(image_path):
+            logger.error(f"File not found: {image_path}")
+            return {"success": False, "error": "File not found"}
+            
+        if not self.is_supported_format(image_path):
+            logger.error(f"Unsupported file format: {image_path}")
+            return {"success": False, "error": "Unsupported file format"}
+        
+        image_data = self.encode_image(image_path)
+        if image_data is None:
+            return {"success": False, "error": "Failed to encode image"}
+        
+        try:
+            # Using a specific prompt to get a detailed description
+            description_prompt = "Please provide a detailed description of this image. Include all visual elements, text, colors, objects, people, and any other important details visible in the image."
+            
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": description_prompt, "images": [image_data]}
+                ]
+            )
+            
+            description = response['message']['content']
+            
+            return {
+                "success": True,
+                "description": description,
+                "metadata": {
+                    "filename": os.path.basename(image_path),
+                    "model": self.model_name
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error describing image: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
+    def ask_about_image(self, image_path: str, question: str) -> Dict[str, Any]:
+        """Ask a question about an image using LLaVa."""
+        if not os.path.exists(image_path):
+            logger.error(f"File not found: {image_path}")
+            return {"success": False, "error": "File not found"}
+            
+        if not self.is_supported_format(image_path):
+            logger.error(f"Unsupported file format: {image_path}")
+            return {"success": False, "error": "Unsupported file format"}
+        
+        image_data = self.encode_image(image_path)
+        if image_data is None:
+            return {"success": False, "error": "Failed to encode image"}
+        
+        try:
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": question, "images": [image_data]}
+                ]
+            )
+            
+            answer = response['message']['content']
+            
+            return {
+                "success": True,
+                "answer": answer,
+                "metadata": {
+                    "filename": os.path.basename(image_path),
+                    "question": question,
+                    "model": self.model_name
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error asking about image: {str(e)}")
+            return {"success": False, "error": str(e)}
+
+
 class RagChatbot:
     """Main class that orchestrates the RAG chatbot functionality."""
 
@@ -607,7 +710,8 @@ class RagChatbot:
                 chats_directory: str = "chats",
                 chunk_size: int = 1000,
                 chunk_overlap: int = 200,
-                groq_api_key: Optional[str] = None):
+                groq_api_key: Optional[str] = None,
+                llava_model: str = 'llava:13b'):
         """Initialize the RAG chatbot."""
         self.llm_model = llm_model
         self.vectorstore = VectorStore(persist_directory, embedding_model)
@@ -622,11 +726,18 @@ class RagChatbot:
         
         # Initialize audio processor
         self.audio_processor = AudioProcessor(api_key=groq_api_key)
+        
+        # Initialize image processor
+        self.image_processor = ImageProcessor(model_name=llava_model)
+        
+        # Store processed images for direct LLaVa interaction
+        self.processed_images = []
 
         # Feature toggles
         self.rag_enabled = True
         self.web_search_enabled = True
         self.audio_enabled = True
+        self.image_enabled = False  # Default to description mode (OFF)
     
     def process_audio(self, audio_file_path: str) -> Dict[str, Any]:
         """Process an audio file and return its transcription."""
@@ -634,6 +745,49 @@ class RagChatbot:
             return {"success": False, "error": "Audio processing is disabled"}
         
         result = self.audio_processor.transcribe(audio_file_path)
+        return result
+    
+    def process_image(self, image_file_path: str) -> Dict[str, Any]:
+        """Process an image file based on the image_enabled toggle."""
+        if not os.path.exists(image_file_path):
+            return {"success": False, "error": "Image file not found"}
+        
+        # Store the image path in processed images list
+        if image_file_path not in self.processed_images:
+            self.processed_images.append(image_file_path)
+        
+        # If image mode is OFF, get description and add to context
+        if not self.image_enabled:
+            result = self.image_processor.describe_image(image_file_path)
+            
+            if result["success"]:
+                # Add the image description to the vector store
+                image_info = f"Image: {result['metadata']['filename']}\n\nDescription: {result['description']}"
+                self.vectorstore.add_document(image_info, source=result['metadata']['filename'])
+                return result
+            else:
+                return result
+        else:
+            # In direct mode, just acknowledge the image was processed
+            return {
+                "success": True,
+                "message": f"Image {os.path.basename(image_file_path)} added to context for direct LLaVa interaction",
+                "mode": "direct_llava"
+            }
+    
+    def ask_about_images(self, question: str) -> Dict[str, Any]:
+        """Ask a question about images using LLaVa when in direct image mode."""
+        if not self.image_enabled or not self.processed_images:
+            return {
+                "success": False, 
+                "error": "Direct image mode is disabled or no images have been processed"
+            }
+        
+        # Select the most recent image for the question
+        image_path = self.processed_images[-1]
+        
+        # Process the question with LLaVa
+        result = self.image_processor.ask_about_image(image_path, question)
         return result
     
     def process_command(self, command: str) -> str:
@@ -652,8 +806,14 @@ class RagChatbot:
         elif command == "!rag off":
             self.rag_enabled = False
             return "RAG retrieval disabled"
+        elif command == "!image on":
+            self.image_enabled = True
+            return "Direct image mode enabled - questions will be answered by LLaVa"
+        elif command == "!image off":
+            self.image_enabled = False
+            return "Image description mode enabled - images will be described and added to context"
         elif command.startswith("!status"):
-            return f"Status: RAG: {'ON' if self.rag_enabled else 'OFF'}, Web Search: {'ON' if self.web_search_enabled else 'OFF'}"
+            return f"Status: RAG: {'ON' if self.rag_enabled else 'OFF'}, Web Search: {'ON' if self.web_search_enabled else 'OFF'}, Image Mode: {'DIRECT' if self.image_enabled else 'DESCRIPTION'}"
         elif command.startswith("!process "):
             # Process documents from a file list
             file_path = command[9:].strip()
@@ -667,9 +827,20 @@ class RagChatbot:
             return ""
 
     def get_response(self, query: str) -> Iterator[Dict[str, Any]]:
-        """Get response for a user query using RAG pipeline."""
+        """Get response for a user query using RAG pipeline or direct image mode."""
         logger.info(f"Processing query: {query[:50]}...")
 
+        # If in direct image mode and there are images, use LLaVa
+        if self.image_enabled and self.processed_images:
+            result = self.ask_about_images(query)
+            if result["success"]:
+                # Return as an iterator with a single item to match the expected interface
+                return iter([{'message': {'content': result["answer"]}}])
+            else:
+                # Fall back to regular processing if image processing fails
+                logger.warning(f"Image processing failed: {result.get('error')}. Falling back to regular processing.")
+        
+        # Regular processing with RAG and web search
         # Initialize contexts
         local_context = ""
         web_context = ""
@@ -748,9 +919,13 @@ mention that in your response. If you don't know the answer, say so clearly."""
         rag_option = input("Enable RAG retrieval? (yes/no, default: yes): ").lower()
         self.rag_enabled = rag_option != "no"
         
+        image_option = input("Enable direct image mode? (yes/no, default: no): ").lower()
+        self.image_enabled = image_option == "yes"
+        
         print(f"Features - RAG: {'enabled' if self.rag_enabled else 'disabled'}, "
-              f"Web search: {'enabled' if self.web_search_enabled else 'disabled'}")
-        print("Commands: !websearch on/off, !rag on/off, !status, !process <file_list.txt>, quit")
+              f"Web search: {'enabled' if self.web_search_enabled else 'disabled'}, "
+              f"Image Mode: {'DIRECT' if self.image_enabled else 'DESCRIPTION'}")
+        print("Commands: !websearch on/off, !rag on/off, !image on/off, !status, !process <file_list.txt>, quit")
         print("Type ',,,' on a new line to submit multi-line input")
         
         # Main conversation loop

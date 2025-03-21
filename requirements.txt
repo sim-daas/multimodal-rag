@@ -43,6 +43,7 @@ gradio==5.22.0
 gradio_client==1.8.0
 greenlet==3.1.1
 groovy==0.1.2
+groq==0.20.0
 grpcio==1.71.0
 grpcio-health-checking==1.71.0
 grpcio-tools==1.71.0
