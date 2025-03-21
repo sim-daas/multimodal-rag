@@ -76,7 +76,7 @@ def scrape_webpage(url):
 url = "https://docs.ultralytics.com/models/yolo12/"
 web_content = scrape_webpage(url)
 
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=500)
 splits = text_splitter.create_documents([web_content])
 
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
