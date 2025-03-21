@@ -196,11 +196,12 @@ def import_document(session_id, file_path):
         try:
             with open(file_path, 'r') as f:
                 first_line = f.readline().strip()
-                # If first line is a path, treat as a document list
+                # If first line is a path or starts with #, treat as a document list
                 if os.path.exists(first_line) or first_line.startswith('#'):
                     process_document_list(session_id, file_path)
                     return
-        except Exception:
+        except Exception as e:
+            print(f"Error reading file: {str(e)}")
             # If there's an error reading the file, try uploading as a regular document
             pass
     
@@ -212,6 +213,7 @@ def upload_single_document(session_id, file_path):
     try:
         print(f"Uploading document: {file_path}")
         
+        # Create multipart form data with the file and session_id
         with open(file_path, 'rb') as file:
             files = {'file': (os.path.basename(file_path), file)}
             data = {'session_id': session_id}
@@ -225,7 +227,7 @@ def upload_single_document(session_id, file_path):
             response.raise_for_status()
             result = response.json()
             
-            print(result["message"])
+            print(f"Upload successful: {result['message']}")
     except Exception as e:
         print(f"Error uploading document: {str(e)}")
 
@@ -234,21 +236,74 @@ def process_document_list(session_id, list_file_path):
     try:
         print(f"Processing document list from: {list_file_path}")
         
-        payload = {
-            "session_id": session_id,
-            "document_list_path": list_file_path
-        }
+        # Read the file to check if it contains valid paths
+        document_paths = []
+        with open(list_file_path, 'r') as f:
+            for line in f:
+                path = line.strip()
+                if path and not path.startswith('#'):  # Skip empty lines and comments
+                    document_paths.append(path)
         
-        response = requests.post(
-            f"{BASE_URL}/documents/process-list",
-            json=payload
-        )
+        if not document_paths:
+            print("No valid document paths found in the list file")
+            return
+            
+        # Check if the server has direct access to these paths
+        print(f"Found {len(document_paths)} documents in list")
+        print("Option 1: Send list file path to server (if server has access to these paths)")
+        print("Option 2: Upload each document individually")
+        choice = input("Enter 1 or 2: ")
         
-        response.raise_for_status()
-        result = response.json()
-        
-        print(f"Document processing: {result['message']}")
-        print(f"Processed {result['processed']} documents successfully, {result['failed']} failed")
+        if choice == "1":
+            # Send the list file path to the server for processing
+            payload = {
+                "session_id": session_id,
+                "document_list_path": list_file_path
+            }
+            
+            response = requests.post(
+                f"{BASE_URL}/documents/process-list",
+                json=payload
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            print(f"Document processing: {result['message']}")
+            print(f"Processed {result.get('processed', 0)} documents successfully, {result.get('failed', 0)} failed")
+            
+        elif choice == "2":
+            # Upload each document individually
+            successful = 0
+            failed = 0
+            
+            for i, doc_path in enumerate(document_paths):
+                print(f"Uploading document {i+1}/{len(document_paths)}: {doc_path}")
+                if os.path.exists(doc_path):
+                    try:
+                        with open(doc_path, 'rb') as file:
+                            files = {'file': (os.path.basename(doc_path), file)}
+                            data = {'session_id': session_id}
+                            
+                            response = requests.post(
+                                f"{BASE_URL}/documents/upload",
+                                files=files,
+                                data=data
+                            )
+                            
+                            response.raise_for_status()
+                            successful += 1
+                    except Exception as e:
+                        print(f"  Error uploading {doc_path}: {str(e)}")
+                        failed += 1
+                else:
+                    print(f"  File not found: {doc_path}")
+                    failed += 1
+            
+            print(f"Completed batch upload: {successful} successful, {failed} failed")
+        else:
+            print("Invalid choice")
+            
     except Exception as e:
         print(f"Error processing document list: {str(e)}")
 
