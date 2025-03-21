@@ -33,6 +33,8 @@ def chat_with_bot():
             print("  load_conversation <name> - Load a saved conversation")
             print("  session_info - Show information about the current session")
             print("  import_document <filepath> - Import a document or a list of documents")
+            print("  process_audio <filepath> - Transcribe and chat with audio file")
+            print("  transcribe_audio <filepath> - Just transcribe audio without chat")
             print("  quit - Exit the chat")
             continue
         
@@ -89,6 +91,23 @@ def chat_with_bot():
                     import_document(session_id, parts[1])
             else:
                 print("Usage: import_document <filepath>")
+            continue
+            
+        if user_input.lower().startswith("process_audio"):
+            parts = user_input.split()
+            if len(parts) == 2:
+                if process_audio_chat(parts[1], session_id):
+                    session_id = process_audio_chat(parts[1], session_id)
+            else:
+                print("Usage: process_audio <filepath>")
+            continue
+
+        if user_input.lower().startswith("transcribe_audio"):
+            parts = user_input.split()
+            if len(parts) == 2:
+                transcribe_audio(parts[1], session_id)
+            else:
+                print("Usage: transcribe_audio <filepath>")
             continue
         
         # Regular chat message
@@ -326,6 +345,77 @@ def get_session_info(session_id):
         print(f"  Message count: {info['message_count']}")
     except requests.RequestException as e:
         print(f"Error getting session information: {e}")
+
+def process_audio_chat(file_path, session_id=None):
+    """Process an audio file and chat about its content."""
+    if not os.path.exists(file_path):
+        print(f"Error: Audio file not found: {file_path}")
+        return session_id
+    
+    try:
+        print(f"Processing audio file: {file_path}")
+        print("Uploading and transcribing audio...")
+        
+        # Create multipart form data with the file and session_id
+        with open(file_path, 'rb') as file:
+            files = {'file': (os.path.basename(file_path), file)}
+            data = {}
+            if session_id:
+                data['session_id'] = session_id
+            
+            response = requests.post(
+                f"{BASE_URL}/audio/chat",
+                files=files,
+                data=data
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            print(f"\nTranscribed text: {result.get('transcribed_text', 'Transcription not returned')}")
+            print(f"\nAI: {result['message']}")
+            
+            return result["session_id"]
+    except Exception as e:
+        print(f"Error processing audio: {str(e)}")
+        return session_id
+
+def transcribe_audio(file_path, session_id=None):
+    """Transcribe an audio file without generating a chat response."""
+    if not os.path.exists(file_path):
+        print(f"Error: Audio file not found: {file_path}")
+        return
+    
+    try:
+        print(f"Transcribing audio file: {file_path}")
+        
+        # Create multipart form data with the file and session_id
+        with open(file_path, 'rb') as file:
+            files = {'file': (os.path.basename(file_path), file)}
+            data = {'add_to_conversation': 'false'}
+            if session_id:
+                data['session_id'] = session_id
+            
+            response = requests.post(
+                f"{BASE_URL}/audio/transcribe",
+                files=files,
+                data=data
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            if result["success"]:
+                print(f"\nTranscribed text: {result['text']}")
+                if result.get('duration'):
+                    print(f"Audio duration: {result['duration']} seconds")
+                if result.get('language'):
+                    print(f"Detected language: {result['language']}")
+            else:
+                print(f"\nTranscription failed: {result.get('error', 'Unknown error')}")
+                
+    except Exception as e:
+        print(f"Error transcribing audio: {str(e)}")
 
 if __name__ == "__main__":
     chat_with_bot()
