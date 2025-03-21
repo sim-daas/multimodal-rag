@@ -8,11 +8,24 @@ import requests
 import json
 import time
 import logging
-from typing import List, Dict, Any, Optional, Iterator, Tuple
+import csv
+import pathlib
+from typing import List, Dict, Any, Optional, Iterator, Tuple, Set, Union
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaEmbeddings
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    CSVLoader,
+    TextLoader,
+    UnstructuredHTMLLoader,
+    UnstructuredMarkdownLoader
+)
+import tqdm
+# Add Weaviate imports
+from langchain_community.vectorstores import Weaviate
+import weaviate
+from weaviate.embedded import EmbeddedOptions
 
 # Set up logging
 logging.basicConfig(
@@ -21,8 +34,277 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ragchatbot")
 
+class DocumentProcessor:
+    """Processes various document types and prepares them for embedding."""
+    
+    # Supported file extensions by category
+    SUPPORTED_EXTENSIONS = {
+        "pdf": [".pdf"],
+        "text": [".txt", ".md", ".log"],
+        "code": [".py", ".js", ".java", ".cpp", ".c", ".h", ".cs", ".rb", ".php", ".html", ".css"],
+        "data": [".csv", ".json", ".xml"],
+        "web": [".html", ".htm"]
+    }
+    
+    def __init__(self, 
+                 vector_store: 'VectorStore',
+                 chunk_size: int = 1000, 
+                 chunk_overlap: int = 200):
+        """Initialize the document processor with a vector store."""
+        self.vector_store = vector_store
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size, 
+            chunk_overlap=chunk_overlap
+        )
+        self.successful_docs = 0
+        self.failed_docs = 0
+    
+    def read_document_paths(self, file_list_path: str) -> List[str]:
+        """Read a list of document paths from a file."""
+        document_paths = []
+        try:
+            with open(file_list_path, 'r') as file:
+                for line in file:
+                    path = line.strip()
+                    if path and not path.startswith('#'):  # Skip empty lines and comments
+                        document_paths.append(path)
+            logger.info(f"Read {len(document_paths)} document paths from {file_list_path}")
+            return document_paths
+        except Exception as e:
+            logger.error(f"Error reading document paths from {file_list_path}: {str(e)}")
+            return []
+    
+    def detect_file_type(self, file_path: str) -> str:
+        """Detect the type of file based on extension."""
+        file_ext = pathlib.Path(file_path).suffix.lower()
+        
+        for category, extensions in self.SUPPORTED_EXTENSIONS.items():
+            if file_ext in extensions:
+                return category
+        
+        return "unknown"
+    
+    def process_document(self, file_path: str) -> bool:
+        """Process a single document and add it to the vector store."""
+        try:
+            if not os.path.exists(file_path):
+                logger.warning(f"File not found: {file_path}")
+                self.failed_docs += 1
+                return False
+            
+            file_type = self.detect_file_type(file_path)
+            logger.info(f"Processing {file_type} document: {file_path}")
+            
+            # Extract text content based on file type
+            if file_type == "pdf":
+                content = self._extract_from_pdf(file_path)
+            elif file_type == "text":
+                content = self._extract_from_text(file_path)
+            elif file_type == "code":
+                content = self._extract_from_code(file_path)
+            elif file_type == "data":
+                content = self._extract_from_data(file_path)
+            elif file_type == "web":
+                content = self._extract_from_web(file_path)
+            else:
+                logger.warning(f"Unsupported file type for {file_path}")
+                self.failed_docs += 1
+                return False
+            
+            if not content:
+                logger.warning(f"No content extracted from {file_path}")
+                self.failed_docs += 1
+                return False
+            
+            # Add document to vector store
+            self.vector_store.add_document(content, source=file_path)
+            self.successful_docs += 1
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error processing document {file_path}: {str(e)}")
+            self.failed_docs += 1
+            return False
+    
+    def process_documents_batch(self, document_paths: List[str]) -> Dict[str, int]:
+        """Process a batch of documents with progress reporting."""
+        self.successful_docs = 0
+        self.failed_docs = 0
+        
+        logger.info(f"Starting batch processing of {len(document_paths)} documents")
+        
+        for doc_path in tqdm.tqdm(document_paths, desc="Processing documents"):
+            self.process_document(doc_path)
+        
+        results = {
+            "total": len(document_paths),
+            "successful": self.successful_docs,
+            "failed": self.failed_docs
+        }
+        
+        logger.info(f"Batch processing complete. Successfully processed {self.successful_docs} documents, {self.failed_docs} failed.")
+        return results
+    
+    def process_documents_from_file(self, file_list_path: str) -> Dict[str, int]:
+        """Process documents listed in a file."""
+        document_paths = self.read_document_paths(file_list_path)
+        if not document_paths:
+            logger.warning(f"No document paths found in {file_list_path}")
+            return {"total": 0, "successful": 0, "failed": 0}
+        
+        return self.process_documents_batch(document_paths)
+    
+    def _extract_from_pdf(self, file_path: str) -> str:
+        """Extract text from a PDF file."""
+        try:
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+            
+            # Extract and join text from all pages
+            text_content = "\n\n".join([doc.page_content for doc in documents])
+            
+            # Handle potential OCR issues - remove excessive whitespace
+            text_content = re.sub(r'\s+', ' ', text_content).strip()
+            
+            return text_content
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF {file_path}: {str(e)}")
+            return ""
+    
+    def _extract_from_text(self, file_path: str) -> str:
+        """Extract text from a plain text file."""
+        file_ext = pathlib.Path(file_path).suffix.lower()
+        
+        try:
+            if file_ext == ".md":
+                loader = UnstructuredMarkdownLoader(file_path)
+                documents = loader.load()
+                return "\n\n".join([doc.page_content for doc in documents])
+            else:  # .txt or other text files
+                loader = TextLoader(file_path)
+                documents = loader.load()
+                return "\n".join([doc.page_content for doc in documents])
+        except Exception as e:
+            logger.error(f"Error extracting text from {file_path}: {str(e)}")
+            # Fallback method
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    return file.read()
+            except Exception as fallback_e:
+                logger.error(f"Fallback extraction failed for {file_path}: {str(fallback_e)}")
+                return ""
+    
+    def _extract_from_code(self, file_path: str) -> str:
+        """Extract content from code files, preserving structure and comments."""
+        try:
+            # Use TextLoader for code files
+            loader = TextLoader(file_path)
+            documents = loader.load()
+            code_content = "\n".join([doc.page_content for doc in documents])
+            
+            # Add file metadata
+            file_name = os.path.basename(file_path)
+            file_ext = pathlib.Path(file_path).suffix.lower()
+            
+            # Enhance the content with metadata
+            enhanced_content = f"File: {file_name}\nType: {file_ext[1:]} code\n\n{code_content}"
+            
+            return enhanced_content
+        except Exception as e:
+            logger.error(f"Error extracting code from {file_path}: {str(e)}")
+            # Fallback method
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    code = file.read()
+                return code
+            except Exception as fallback_e:
+                logger.error(f"Fallback extraction failed for {file_path}: {str(fallback_e)}")
+                return ""
+    
+    def _extract_from_data(self, file_path: str) -> str:
+        """Extract content from data files like CSV, JSON."""
+        file_ext = pathlib.Path(file_path).suffix.lower()
+        
+        try:
+            if file_ext == ".csv":
+                # For CSV, we want to create a readable representation
+                result = []
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    csv_reader = csv.reader(file)
+                    headers = next(csv_reader, None)
+                    if headers:
+                        result.append("Headers: " + ", ".join(headers))
+                        for i, row in enumerate(csv_reader):
+                            if i < 10:  # Only include first 10 rows for context
+                                result.append(" | ".join(row))
+                            else:
+                                result.append("... (additional rows omitted)")
+                                break
+                return "\n".join(result)
+            
+            elif file_ext == ".json":
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    data = json.load(file)
+                    # Return a formatted string representation
+                    return json.dumps(data, indent=2)
+            
+            elif file_ext == ".xml":
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    return file.read()
+            
+            else:
+                # For other data files, read as text
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    return file.read()
+        
+        except Exception as e:
+            logger.error(f"Error extracting data from {file_path}: {str(e)}")
+            return ""
+    
+    def _extract_from_web(self, file_path: str) -> str:
+        """Extract content from HTML files."""
+        try:
+            loader = UnstructuredHTMLLoader(file_path)
+            documents = loader.load()
+            content = "\n\n".join([doc.page_content for doc in documents])
+            
+            # Clean up HTML content
+            content = re.sub(r'\s+', ' ', content).strip()
+            
+            return content
+        except Exception as e:
+            logger.error(f"Error extracting content from HTML {file_path}: {str(e)}")
+            
+            # Fallback using BeautifulSoup
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as file:
+                    html_content = file.read()
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    
+                    # Remove script and style elements
+                    for script in soup(["script", "style"]):
+                        script.extract()
+                    
+                    # Get text
+                    text = soup.get_text()
+                    
+                    # Break into lines and remove leading/trailing space
+                    lines = (line.strip() for line in text.splitlines())
+                    # Break multi-headlines into a line each
+                    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                    # Remove blank lines
+                    text = '\n'.join(chunk for chunk in chunks if chunk)
+                    
+                    return text
+            except Exception as fallback_e:
+                logger.error(f"Fallback HTML extraction failed for {file_path}: {str(fallback_e)}")
+                return ""
+
+
 class VectorStore:
-    """Manages document embeddings and retrieval from local vector database."""
+    """Manages document embeddings and retrieval from Weaviate vector database."""
     
     def __init__(self, persist_directory: str = "./vector_db", model_name: str = "nomic-embed-text"):
         """Initialize the vector store with embedding model."""
@@ -37,31 +319,43 @@ class VectorStore:
         """Initialize the embedding function and vector store."""
         try:
             self.embedding_function = OllamaEmbeddings(model=self.model_name)
-            # Check if vector store exists
-            if os.path.exists(self.persist_directory):
-                logger.info(f"Loading existing vector store from {self.persist_directory}")
-                self.vectorstore = Chroma(
-                    persist_directory=self.persist_directory,
-                    embedding_function=self.embedding_function
-                )
-            else:
-                logger.warning(f"No existing vector store found at {self.persist_directory}. Creating empty store.")
-                self.vectorstore = Chroma(
-                    embedding_function=self.embedding_function,
-                    persist_directory=self.persist_directory
-                )
+            
+            # Create Weaviate client connecting to localhost:8080
+            client = weaviate.Client("http://localhost:8080")
+            
+            # Check if client is ready
+            if not client.is_ready():
+                logger.error("Weaviate server is not ready")
+                raise ConnectionError("Could not connect to Weaviate server at localhost:8080")
+                
+            logger.info(f"Connected to Weaviate at localhost:8080")
+            
+            # Initialize Weaviate vector store
+            self.vectorstore = Weaviate(
+                client=client, 
+                index_name="DocsIndex", 
+                embedding=self.embedding_function,
+                text_key="content"
+            )
+            
         except Exception as e:
             logger.error(f"Error initializing vector store: {str(e)}")
             raise
 
     def retrieve_context(self, query: str, k: int = 5) -> str:
-        """Retrieve relevant context from vector store."""
+        """Retrieve relevant context from vector store using hybrid search."""
         if not self.vectorstore:
             logger.warning("Vector store not initialized")
             return ""
 
         try:
-            results = self.vectorstore.similarity_search(query, k=k)
+            # Use hybrid search combining keyword and vector search
+            results = self.vectorstore.hybrid_search(
+                query, 
+                alpha=0.7,  # Balance between keyword and vector search (0.0 = all keyword, 1.0 = all vector)
+                k=k
+            )
+            
             if not results:
                 return ""
 
@@ -272,12 +566,19 @@ class RagChatbot:
                 llm_model: str = 'deepseek-r1:8b',
                 embedding_model: str = 'nomic-embed-text',
                 persist_directory: str = "./vector_db",
-                chats_directory: str = "chats"):
+                chats_directory: str = "chats",
+                chunk_size: int = 1000,
+                chunk_overlap: int = 200):
         """Initialize the RAG chatbot."""
         self.llm_model = llm_model
         self.vectorstore = VectorStore(persist_directory, embedding_model)
         self.websearch = WebSearch()
         self.conversation_manager = ConversationManager(chats_directory)
+        self.document_processor = DocumentProcessor(
+            vector_store=self.vectorstore,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
         self.conversation_history = [{"role": "system", "content": "You are a helpful AI assistant."}]
 
         # Feature toggles
@@ -302,6 +603,15 @@ class RagChatbot:
             return "RAG retrieval disabled"
         elif command.startswith("!status"):
             return f"Status: RAG: {'ON' if self.rag_enabled else 'OFF'}, Web Search: {'ON' if self.web_search_enabled else 'OFF'}"
+        elif command.startswith("!process "):
+            # Process documents from a file list
+            file_path = command[9:].strip()
+            if os.path.exists(file_path):
+                print(f"Processing documents from {file_path}...")
+                results = self.document_processor.process_documents_from_file(file_path)
+                return f"Processed {results['successful']} documents successfully, {results['failed']} failed"
+            else:
+                return f"File not found: {file_path}"
         else:
             return ""
 
@@ -389,7 +699,7 @@ mention that in your response. If you don't know the answer, say so clearly."""
         
         print(f"Features - RAG: {'enabled' if self.rag_enabled else 'disabled'}, "
               f"Web search: {'enabled' if self.web_search_enabled else 'disabled'}")
-        print("Commands: !websearch on/off, !rag on/off, !status, quit")
+        print("Commands: !websearch on/off, !rag on/off, !status, !process <file_list.txt>, quit")
         print("Type ',,,' on a new line to submit multi-line input")
         
         # Main conversation loop
