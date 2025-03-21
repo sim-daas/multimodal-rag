@@ -32,6 +32,7 @@ def chat_with_bot():
             print("  list_conversations - List all saved conversations")
             print("  load_conversation <name> - Load a saved conversation")
             print("  session_info - Show information about the current session")
+            print("  import_document <filepath> - Import a document or a list of documents")
             print("  quit - Exit the chat")
             continue
         
@@ -77,6 +78,17 @@ def chat_with_bot():
             
         if user_input.lower() == "session_info":
             get_session_info(session_id)
+            continue
+            
+        if user_input.lower().startswith("import_document"):
+            parts = user_input.split()
+            if len(parts) == 2:
+                if not session_id:
+                    print("No active session. Send a message first.")
+                else:
+                    import_document(session_id, parts[1])
+            else:
+                print("Usage: import_document <filepath>")
             continue
         
         # Regular chat message
@@ -171,6 +183,74 @@ def load_conversation(name):
     except requests.RequestException as e:
         print(f"Error loading conversation: {e}")
         return None
+
+def import_document(session_id, file_path):
+    """Import a document or list of documents into the system."""
+    if not os.path.exists(file_path):
+        print(f"Error: File not found: {file_path}")
+        return
+    
+    # Check if the file is a text file that might contain a list of documents
+    if file_path.lower().endswith('.txt'):
+        # Check first line to determine if it's a list file
+        try:
+            with open(file_path, 'r') as f:
+                first_line = f.readline().strip()
+                # If first line is a path, treat as a document list
+                if os.path.exists(first_line) or first_line.startswith('#'):
+                    process_document_list(session_id, file_path)
+                    return
+        except Exception:
+            # If there's an error reading the file, try uploading as a regular document
+            pass
+    
+    # If not determined to be a list file, upload as a single document
+    upload_single_document(session_id, file_path)
+
+def upload_single_document(session_id, file_path):
+    """Upload a single document file to the API."""
+    try:
+        print(f"Uploading document: {file_path}")
+        
+        with open(file_path, 'rb') as file:
+            files = {'file': (os.path.basename(file_path), file)}
+            data = {'session_id': session_id}
+            
+            response = requests.post(
+                f"{BASE_URL}/documents/upload",
+                files=files,
+                data=data
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            print(result["message"])
+    except Exception as e:
+        print(f"Error uploading document: {str(e)}")
+
+def process_document_list(session_id, list_file_path):
+    """Process a list of documents from a file."""
+    try:
+        print(f"Processing document list from: {list_file_path}")
+        
+        payload = {
+            "session_id": session_id,
+            "document_list_path": list_file_path
+        }
+        
+        response = requests.post(
+            f"{BASE_URL}/documents/process-list",
+            json=payload
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        print(f"Document processing: {result['message']}")
+        print(f"Processed {result['processed']} documents successfully, {result['failed']} failed")
+    except Exception as e:
+        print(f"Error processing document list: {str(e)}")
 
 def get_session_info(session_id):
     """Get information about the current session."""
