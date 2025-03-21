@@ -273,11 +273,38 @@ async def upload_document(
         with open(temp_file_path, "wb") as f:
             f.write(contents)
         
-        # Add document to vector store
-        with open(temp_file_path, "r", encoding="utf-8", errors="replace") as f:
-            document_content = f.read()
+        # Process document using DocumentProcessor
+        document_processor = chatbot.document_processor
         
-        chatbot.vectorstore.add_document(document_content, source=file.filename)
+        # Detect file type
+        file_type = document_processor.detect_file_type(temp_file_path)
+        
+        # Extract content based on file type
+        content = ""
+        if file_type == "pdf":
+            content = document_processor._extract_from_pdf(temp_file_path)
+        elif file_type == "text":
+            content = document_processor._extract_from_text(temp_file_path)
+        elif file_type == "code":
+            content = document_processor._extract_from_code(temp_file_path)
+        elif file_type == "data":
+            content = document_processor._extract_from_data(temp_file_path)
+        elif file_type == "web":
+            content = document_processor._extract_from_web(temp_file_path)
+        else:
+            # Fallback for unknown file types
+            with open(temp_file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        
+        if not content:
+            return DocumentUploadResponse(
+                success=False,
+                filename=file.filename,
+                message=f"No content could be extracted from {file.filename}"
+            )
+        
+        # Add document to vector store
+        chatbot.vectorstore.add_document(content, source=file.filename)
         
         # Schedule cleanup in background
         if background_tasks:
