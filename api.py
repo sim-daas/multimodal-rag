@@ -13,8 +13,9 @@ from fastapi.responses import JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, EmailStr
+from groq import Groq
 
-from newclass import RagChatbot, VectorStore, WebSearch, ConversationManager
+from newclass import RagChatbot, VectorStore, WebSearch, ConversationManager, AudioProcessor
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -92,6 +93,15 @@ class ErrorResponse(BaseModel):
     """Standard error response."""
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(None, description="Detailed explanation")
+
+class AudioTranscriptionResponse(BaseModel):
+    """Response after audio transcription."""
+    success: bool = Field(..., description="Whether the audio was successfully transcribed")
+    text: Optional[str] = Field(None, description="Transcribed text")
+    session_id: str = Field(..., description="Session ID for conversation continuity")
+    error: Optional[str] = Field(None, description="Error message if transcription failed")
+    duration: Optional[float] = Field(None, description="Duration of the audio in seconds")
+    language: Optional[str] = Field(None, description="Detected language of the audio")
 
 # ----- Helper Functions -----
 
@@ -462,6 +472,142 @@ async def delete_session(session_id: str):
         "session_id": session_id,
         "message": f"Session {session_id} deleted"
     }
+
+@app.post("/audio/transcribe", response_model=AudioTranscriptionResponse)
+async def transcribe_audio(
+    session_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    add_to_conversation: bool = Form(False),
+    background_tasks: BackgroundTasks = None
+):
+    """Transcribe an audio file and optionally add it to the conversation."""
+    # Get or create a session
+    session_id, chatbot = get_or_create_session(session_id)
+    
+    # Validate audio file format
+    if not chatbot.audio_processor.is_supported_format(file.filename):
+        return AudioTranscriptionResponse(
+            success=False,
+            session_id=session_id,
+            error=f"Unsupported audio format. Supported formats: {', '.join(chatbot.audio_processor.supported_formats)}"
+        )
+    
+    # Create a temporary file to save the upload
+    temp_file_path = f"./temp_audio_{file.filename}"
+    
+    try:
+        # Save the uploaded file
+        contents = await file.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(contents)
+        
+        # Process audio file
+        result = chatbot.process_audio(temp_file_path)
+        
+        if not result["success"]:
+            return AudioTranscriptionResponse(
+                success=False,
+                session_id=session_id,
+                error=result.get("error", "Unknown error during transcription")
+            )
+        
+        transcribed_text = result["text"]
+        
+        # Add transcription to conversation if requested
+        if add_to_conversation and transcribed_text:
+            chatbot.conversation_history.append({"role": "user", "content": transcribed_text})
+        
+        # Schedule cleanup in background
+        if background_tasks:
+            background_tasks.add_task(lambda: os.remove(temp_file_path) if os.path.exists(temp_file_path) else None)
+        
+        return AudioTranscriptionResponse(
+            success=True,
+            text=transcribed_text,
+            session_id=session_id,
+            duration=result.get("metadata", {}).get("duration"),
+            language=result.get("metadata", {}).get("language")
+        )
+    
+    except Exception as e:
+        # Clean up temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
+        return AudioTranscriptionResponse(
+            success=False,
+            session_id=session_id,
+            error=f"Error processing audio: {str(e)}"
+        )
+
+@app.post("/audio/chat", response_model=ChatResponse)
+async def audio_chat(
+    session_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """Transcribe an audio file, add it to the conversation, and get a response."""
+    # Get or create a session
+    session_id, chatbot = get_or_create_session(session_id)
+    
+    # Create a temporary file to save the upload
+    temp_file_path = f"./temp_audio_{file.filename}"
+    
+    try:
+        # Save the uploaded file
+        contents = await file.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(contents)
+        
+        # Process audio file
+        result = chatbot.process_audio(temp_file_path)
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio transcription failed: {result.get('error', 'Unknown error')}"
+            )
+        
+        transcribed_text = result["text"]
+        
+        # Add transcription to conversation
+        chatbot.conversation_history.append({"role": "user", "content": transcribed_text})
+        
+        # Process message with RAG pipeline
+        response_iterator = chatbot.get_response(transcribed_text)
+        
+        # Collect response
+        assistant_response = ""
+        for chunk in response_iterator:
+            assistant_response += chunk['message']['content']
+        
+        # Add assistant response to conversation history
+        chatbot.conversation_history.append({"role": "assistant", "content": assistant_response})
+        
+        # Schedule cleanup in background
+        if background_tasks:
+            background_tasks.add_task(lambda: os.remove(temp_file_path) if os.path.exists(temp_file_path) else None)
+        
+        return ChatResponse(
+            message=assistant_response,
+            session_id=session_id
+        )
+    
+    except HTTPException:
+        # Clean up temp file and re-raise the exception
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise
+    
+    except Exception as e:
+        # Clean up temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing audio chat: {str(e)}"
+        )
 
 # Error handlers
 @app.exception_handler(HTTPException)

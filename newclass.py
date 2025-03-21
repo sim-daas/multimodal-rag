@@ -23,6 +23,7 @@ from langchain_community.document_loaders import (
     UnstructuredMarkdownLoader
 )
 import tqdm
+from groq import Groq
 
 # Set up logging
 logging.basicConfig(
@@ -544,6 +545,58 @@ class ConversationManager:
             return False
 
 
+class AudioProcessor:
+    """Processes audio files and transcribes them using Groq API."""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        """Initialize the audio processor with optional API key."""
+        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
+        if not self.api_key:
+            logger.warning("No Groq API key provided. Audio transcription will not work.")
+        
+        self.client = Groq(api_key=self.api_key) if self.api_key else None
+        self.supported_formats = [".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"]
+    
+    def is_supported_format(self, filename: str) -> bool:
+        """Check if the file format is supported for transcription."""
+        file_ext = pathlib.Path(filename).suffix.lower()
+        return file_ext in self.supported_formats
+    
+    def transcribe(self, file_path: str) -> Dict[str, Any]:
+        """Transcribe an audio file using Groq API."""
+        if not self.client:
+            logger.error("Cannot transcribe audio: Groq client not initialized")
+            return {"success": False, "error": "Groq API key not configured"}
+        
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return {"success": False, "error": "File not found"}
+            
+        if not self.is_supported_format(file_path):
+            logger.error(f"Unsupported file format: {file_path}")
+            return {"success": False, "error": "Unsupported file format"}
+        
+        try:
+            with open(file_path, "rb") as file:
+                transcription = self.client.audio.transcriptions.create(
+                    file=(os.path.basename(file_path), file.read()),
+                    model="whisper-large-v3",
+                    response_format="verbose_json",
+                )
+            
+            return {
+                "success": True,
+                "text": transcription.text,
+                "metadata": {
+                    "duration": getattr(transcription, "duration", None),
+                    "language": getattr(transcription, "language", None)
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error transcribing audio: {str(e)}")
+            return {"success": False, "error": str(e)}
+
+
 class RagChatbot:
     """Main class that orchestrates the RAG chatbot functionality."""
 
@@ -553,7 +606,8 @@ class RagChatbot:
                 persist_directory: str = "./vector_db",
                 chats_directory: str = "chats",
                 chunk_size: int = 1000,
-                chunk_overlap: int = 200):
+                chunk_overlap: int = 200,
+                groq_api_key: Optional[str] = None):
         """Initialize the RAG chatbot."""
         self.llm_model = llm_model
         self.vectorstore = VectorStore(persist_directory, embedding_model)
@@ -565,11 +619,23 @@ class RagChatbot:
             chunk_overlap=chunk_overlap
         )
         self.conversation_history = [{"role": "system", "content": "You are a helpful AI assistant."}]
+        
+        # Initialize audio processor
+        self.audio_processor = AudioProcessor(api_key=groq_api_key)
 
         # Feature toggles
         self.rag_enabled = True
         self.web_search_enabled = True
-
+        self.audio_enabled = True
+    
+    def process_audio(self, audio_file_path: str) -> Dict[str, Any]:
+        """Process an audio file and return its transcription."""
+        if not self.audio_enabled:
+            return {"success": False, "error": "Audio processing is disabled"}
+        
+        result = self.audio_processor.transcribe(audio_file_path)
+        return result
+    
     def process_command(self, command: str) -> str:
         """Process system commands."""
         command = command.strip().lower()
