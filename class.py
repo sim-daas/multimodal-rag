@@ -321,7 +321,7 @@ class VectorStore:
             self.embedding_function = OllamaEmbeddings(model=self.model_name)
             
             # Create Weaviate client connecting to localhost:8080
-            client = weaviate.Client(url="http://localhost:8080")
+            client = weaviate.Client()
             
             # Check if client is ready
             if not client.is_ready():

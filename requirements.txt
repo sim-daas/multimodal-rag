@@ -186,7 +186,7 @@ uvicorn==0.34.0
 uvloop==0.21.0
 validators==0.34.0
 watchfiles==1.0.4
-weaviate-client==4.11.2
+weaviate-client==3.26.7
 webencodings==0.5.1
 websocket-client==1.8.0
 websockets==15.0.1
