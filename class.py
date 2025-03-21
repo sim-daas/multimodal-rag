@@ -13,7 +13,6 @@ import pathlib
 from typing import List, Dict, Any, Optional, Iterator, Tuple, Set, Union
 from bs4 import BeautifulSoup
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.document_loaders import (
     PyPDFLoader,
@@ -23,6 +22,10 @@ from langchain_community.document_loaders import (
     UnstructuredMarkdownLoader
 )
 import tqdm
+# Add Weaviate imports
+from langchain_community.vectorstores import Weaviate
+import weaviate
+from weaviate.embedded import EmbeddedOptions
 
 # Set up logging
 logging.basicConfig(
@@ -301,7 +304,7 @@ class DocumentProcessor:
 
 
 class VectorStore:
-    """Manages document embeddings and retrieval from local vector database."""
+    """Manages document embeddings and retrieval from Weaviate vector database."""
     
     def __init__(self, persist_directory: str = "./vector_db", model_name: str = "nomic-embed-text"):
         """Initialize the vector store with embedding model."""
@@ -316,31 +319,43 @@ class VectorStore:
         """Initialize the embedding function and vector store."""
         try:
             self.embedding_function = OllamaEmbeddings(model=self.model_name)
-            # Check if vector store exists
-            if os.path.exists(self.persist_directory):
-                logger.info(f"Loading existing vector store from {self.persist_directory}")
-                self.vectorstore = Chroma(
-                    persist_directory=self.persist_directory,
-                    embedding_function=self.embedding_function
-                )
-            else:
-                logger.warning(f"No existing vector store found at {self.persist_directory}. Creating empty store.")
-                self.vectorstore = Chroma(
-                    embedding_function=self.embedding_function,
-                    persist_directory=self.persist_directory
-                )
+            
+            # Create Weaviate client connecting to localhost:8080
+            client = weaviate.Client(url="http://localhost:8080")
+            
+            # Check if client is ready
+            if not client.is_ready():
+                logger.error("Weaviate server is not ready")
+                raise ConnectionError("Could not connect to Weaviate server at localhost:8080")
+                
+            logger.info(f"Connected to Weaviate at localhost:8080")
+            
+            # Initialize Weaviate vector store
+            self.vectorstore = Weaviate(
+                client=client, 
+                index_name="DocsIndex", 
+                embedding=self.embedding_function,
+                text_key="content"
+            )
+            
         except Exception as e:
             logger.error(f"Error initializing vector store: {str(e)}")
             raise
 
     def retrieve_context(self, query: str, k: int = 5) -> str:
-        """Retrieve relevant context from vector store."""
+        """Retrieve relevant context from vector store using hybrid search."""
         if not self.vectorstore:
             logger.warning("Vector store not initialized")
             return ""
 
         try:
-            results = self.vectorstore.similarity_search(query, k=k)
+            # Use hybrid search combining keyword and vector search
+            results = self.vectorstore.hybrid_search(
+                query, 
+                alpha=0.7,  # Balance between keyword and vector search (0.0 = all keyword, 1.0 = all vector)
+                k=k
+            )
+            
             if not results:
                 return ""
 
