@@ -2,14 +2,17 @@
 
 import os
 import uuid
+import json
+import logging
 from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, timedelta
+import asyncio
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, UploadFile, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, EmailStr
@@ -27,11 +30,18 @@ app = FastAPI(
 # Add CORS middleware for web clients
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with specific origins in production
+    allow_origins=["http://localhost:3000", "https://yourdomain.com"],  # Update with your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Configure a logger for API requests
+api_logger = logging.getLogger("api")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+api_logger.addHandler(handler)
+api_logger.setLevel(logging.INFO)
 
 # Session management
 sessions: Dict[str, RagChatbot] = {}
@@ -186,6 +196,73 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             status_code=500,
             detail=f"Error processing message: {str(e)}"
         )
+
+@app.post("/chat/stream")
+async def stream_chat(request: ChatRequest):
+    """Stream a chat response for realtime UI updates."""
+    api_logger.info(f"Received streaming chat request: {request.message[:50]}...")
+    
+    session_id, chatbot = get_or_create_session(request.session_id)
+    api_logger.info(f"Using session: {session_id} for streaming request")
+    
+    try:
+        # Add user message to conversation history
+        chatbot.conversation_history.append({"role": "user", "content": request.message})
+        api_logger.info(f"Added user message to history, now generating response")
+        
+        # Get streaming response iterator from the chatbot
+        response_iterator = chatbot.get_response(request.message)
+        
+        # Create an async generator for streaming the response
+        async def generate():
+            full_response = ""
+            chunk_count = 0
+            
+            try:
+                # Process each chunk from the iterator
+                for chunk in response_iterator:
+                    chunk_count += 1
+                    content = chunk['message']['content']
+                    full_response += content
+                    api_logger.info(f"Sending chunk {chunk_count}: {content[:20]}...")
+                    
+                    # Format as server-sent event
+                    yield f"data: {json.dumps({'content': content, 'full_response': full_response, 'session_id': session_id})}\n\n"
+                    await asyncio.sleep(0.01)  # Small delay to ensure proper streaming
+                
+                # After completion, add response to history
+                chatbot.conversation_history.append({"role": "assistant", "content": full_response})
+                api_logger.info(f"Completed streaming response with {chunk_count} chunks. Total length: {len(full_response)}")
+            except Exception as e:
+                api_logger.error(f"Error during response generation: {str(e)}")
+                # Send error message to client
+                yield f"data: {json.dumps({'error': str(e), 'session_id': session_id})}\n\n"
+        
+        # Return streaming response
+        return StreamingResponse(
+            generate(), 
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Disable buffering for Nginx
+            }
+        )
+    except Exception as e:
+        api_logger.error(f"Error in chat stream endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing message: {str(e)}"
+        )
+
+@app.get("/api/healthcheck", response_model=dict)
+async def healthcheck():
+    """Health check endpoint for the frontend to test connectivity."""
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0"
+    }
 
 @app.get("/sessions", response_model=List[SessionInfo])
 async def list_sessions():
