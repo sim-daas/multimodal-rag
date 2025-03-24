@@ -2,23 +2,24 @@
 
 import os
 import uuid
+import json
+import logging
 from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, timedelta
+import asyncio
+
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, File, UploadFile, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, EmailStr
 from groq import Groq
 
 from newclass import RagChatbot, VectorStore, WebSearch, ConversationManager, AudioProcessor
-
-import shutil
-from pathlib import Path
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -30,24 +31,23 @@ app = FastAPI(
 # Add CORS middleware for web clients
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with specific origins in production
+    allow_origins=["http://localhost:3000", "https://yourdomain.com"],  # Update with your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Configure a logger for API requests
+api_logger = logging.getLogger("api")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+api_logger.addHandler(handler)
+api_logger.setLevel(logging.INFO)
+
 # Session management
 sessions: Dict[str, RagChatbot] = {}
 session_last_active: Dict[str, datetime] = {}
 SESSION_TIMEOUT_MINUTES = 30
-
-# Define base upload directory
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Add this logger initialization near the top of the file, before any function definitions
-import logging
-logger = logging.getLogger("api")
 
 # ----- Pydantic Models -----
 
@@ -56,16 +56,10 @@ class Message(BaseModel):
     role: str = Field(..., description="The role of the message sender (user, assistant, or system)")
     content: str = Field(..., description="The content of the message")
 
-class ChatSettings(BaseModel):
-    """Model for chat settings."""
-    rag_enabled: Optional[bool] = Field(None, description="Whether to enable RAG retrieval")
-    web_search_enabled: Optional[bool] = Field(None, description="Whether to enable web search")
-
 class ChatRequest(BaseModel):
     """Model for chat message request."""
     message: str = Field(..., description="User message to send to the chatbot")
     session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
-    settings: Optional[ChatSettings] = Field(None, description="Settings for this chat request")
 
 class ChatResponse(BaseModel):
     """Model for chat message response."""
@@ -79,12 +73,13 @@ class SessionInfo(BaseModel):
     last_active: datetime = Field(..., description="When the session was last used")
     rag_enabled: bool = Field(..., description="Whether RAG retrieval is enabled")
     web_search_enabled: bool = Field(..., description="Whether web search is enabled")
+    image_mode_enabled: bool = Field(False, description="Whether image mode is enabled")
     message_count: int = Field(..., description="Number of messages in the conversation")
 
 class FeatureToggleRequest(BaseModel):
     """Request model for toggling features."""
     session_id: str = Field(..., description="Session ID for the conversation")
-    feature: str = Field(..., description="Feature to toggle: 'rag' or 'websearch'")
+    feature: str = Field(..., description="Feature to toggle: 'rag', 'websearch', or 'image'")
     enabled: bool = Field(..., description="Whether to enable or disable the feature")
 
 class DocumentUploadResponse(BaseModel):
@@ -120,39 +115,14 @@ class AudioTranscriptionResponse(BaseModel):
     duration: Optional[float] = Field(None, description="Duration of the audio in seconds")
     language: Optional[str] = Field(None, description="Detected language of the audio")
 
-class UploadedFile(BaseModel):
-    """Information about an uploaded file."""
-    filename: str
-    path: str
-    upload_time: datetime
-    file_size: int
-    file_type: str
-
-class UploadedFileListResponse(BaseModel):
-    """Response containing list of uploaded files."""
-    session_id: str
-    files: List[UploadedFile]
-
-class FileAnalysisRequest(BaseModel):
-    """Request to analyze a specific file."""
-    session_id: str = Field(..., description="Session ID of the conversation")
-    filename: str = Field(..., description="Filename to analyze")
-
-class FileAnalysisResponse(BaseModel):
-    """Response after file analysis."""
-    success: bool = Field(..., description="Whether the analysis was successful")
-    filename: str = Field(..., description="Name of the analyzed file")
-    analysis: str = Field(..., description="Analysis results")
-    message: str = Field(..., description="Status message")
-
-class CreateSessionRequest(BaseModel):
-    """Request to create a new session."""
-    settings: Optional[ChatSettings] = Field(None, description="Initial settings for the session")
-
-class CreateSessionResponse(BaseModel):
-    """Response after creating a session."""
-    session_id: str = Field(..., description="Session ID for the new session")
-    message: str = Field(..., description="Status message")
+class ImageUploadResponse(BaseModel):
+    """Response after image upload."""
+    success: bool = Field(..., description="Whether the image was successfully processed")
+    image_id: Optional[str] = Field(None, description="Unique ID for the uploaded image")
+    filename: str = Field(..., description="Name of the processed file")
+    description: Optional[str] = Field(None, description="AI-generated description of the image")
+    message: str = Field(..., description="Processing status message")
+    error: Optional[str] = Field(None, description="Error message if processing failed")
 
 # ----- Helper Functions -----
 
@@ -183,39 +153,6 @@ def cleanup_inactive_sessions():
         if session_id in session_last_active:
             del session_last_active[session_id]
 
-def get_session_upload_dir(session_id: str) -> str:
-    """Get the upload directory for a session and create it if it doesn't exist."""
-    session_dir = os.path.join(UPLOAD_DIR, session_id)
-    os.makedirs(session_dir, exist_ok=True)
-    return session_dir
-
-def get_session_files(session_id: str) -> List[UploadedFile]:
-    """Get list of files uploaded for a session."""
-    session_dir = os.path.join(UPLOAD_DIR, session_id)
-    
-    if not os.path.exists(session_dir):
-        return []
-        
-    files = []
-    
-    for filename in os.listdir(session_dir):
-        file_path = os.path.join(session_dir, filename)
-        if os.path.isfile(file_path):
-            stats = os.stat(file_path)
-            file_type = filename.split('.')[-1] if '.' in filename else 'unknown'
-            
-            files.append(UploadedFile(
-                filename=filename,
-                path=file_path,
-                upload_time=datetime.fromtimestamp(stats.st_mtime),
-                file_size=stats.st_size,
-                file_type=file_type
-            ))
-    
-    # Sort by upload time, newest first
-    files.sort(key=lambda x: x.upload_time, reverse=True)
-    return files
-
 # ----- API Endpoints -----
 
 @app.get("/", response_model=dict)
@@ -227,7 +164,6 @@ async def root():
         "version": "1.0.0"
     }
 
-
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """Send a message to the chatbot and get a response."""
@@ -236,18 +172,6 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     
     # Get or create a session
     session_id, chatbot = get_or_create_session(request.session_id)
-    
-    # Update feature settings from the request if provided
-    if request.settings:
-        print(f"Received settings: rag_enabled={request.settings.rag_enabled}, web_search_enabled={request.settings.web_search_enabled}")
-        
-        if request.settings.rag_enabled is not None:
-            chatbot.rag_enabled = request.settings.rag_enabled
-            print(f"Set chatbot.rag_enabled to {chatbot.rag_enabled}")
-        
-        if request.settings.web_search_enabled is not None:
-            chatbot.web_search_enabled = request.settings.web_search_enabled
-            print(f"Set chatbot.web_search_enabled to {chatbot.web_search_enabled}")
     
     try:
         # Add user message to conversation history
@@ -274,6 +198,72 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             detail=f"Error processing message: {str(e)}"
         )
 
+@app.post("/chat/stream")
+async def stream_chat(request: ChatRequest):
+    """Stream a chat response for realtime UI updates."""
+    api_logger.info(f"Received streaming chat request: {request.message[:50]}...")
+    
+    session_id, chatbot = get_or_create_session(request.session_id)
+    api_logger.info(f"Using session: {session_id} for streaming request")
+    
+    try:
+        # Add user message to conversation history
+        chatbot.conversation_history.append({"role": "user", "content": request.message})
+        api_logger.info(f"Added user message to history, now generating response")
+        
+        # Get streaming response iterator from the chatbot
+        response_iterator = chatbot.get_response(request.message)
+        
+        # Create an async generator for streaming the response
+        async def generate():
+            full_response = ""
+            chunk_count = 0
+            
+            try:
+                # Process each chunk from the iterator
+                for chunk in response_iterator:
+                    chunk_count += 1
+                    content = chunk['message']['content']
+                    full_response += content
+                    api_logger.info(f"Sending chunk {chunk_count}: {content[:20]}...")
+                    
+                    # Format as server-sent event
+                    yield f"data: {json.dumps({'content': content, 'full_response': full_response, 'session_id': session_id})}\n\n"
+                    await asyncio.sleep(0.01)  # Small delay to ensure proper streaming
+                
+                # After completion, add response to history
+                chatbot.conversation_history.append({"role": "assistant", "content": full_response})
+                api_logger.info(f"Completed streaming response with {chunk_count} chunks. Total length: {len(full_response)}")
+            except Exception as e:
+                api_logger.error(f"Error during response generation: {str(e)}")
+                # Send error message to client
+                yield f"data: {json.dumps({'error': str(e), 'session_id': session_id})}\n\n"
+        
+        # Return streaming response
+        return StreamingResponse(
+            generate(), 
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Disable buffering for Nginx
+            }
+        )
+    except Exception as e:
+        api_logger.error(f"Error in chat stream endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing message: {str(e)}"
+        )
+
+@app.get("/api/healthcheck", response_model=dict)
+async def healthcheck():
+    """Health check endpoint for the frontend to test connectivity."""
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0"
+    }
 
 @app.get("/sessions", response_model=List[SessionInfo])
 async def list_sessions():
@@ -286,6 +276,7 @@ async def list_sessions():
             last_active=session_last_active[session_id],
             rag_enabled=chatbot.rag_enabled,
             web_search_enabled=chatbot.web_search_enabled,
+            image_mode_enabled=chatbot.image_mode_enabled,
             message_count=len([m for m in chatbot.conversation_history if m["role"] != "system"])
         ))
     return result
@@ -306,6 +297,7 @@ async def get_session(session_id: str):
         last_active=session_last_active[session_id],
         rag_enabled=chatbot.rag_enabled,
         web_search_enabled=chatbot.web_search_enabled,
+        image_mode_enabled=chatbot.image_mode_enabled,
         message_count=len([m for m in chatbot.conversation_history if m["role"] != "system"])
     )
 
@@ -326,7 +318,7 @@ async def get_conversation_history(session_id: str):
 
 @app.post("/features/toggle", response_model=dict)
 async def toggle_feature(request: FeatureToggleRequest):
-    """Toggle RAG or web search features."""
+    """Toggle RAG, web search, or image mode features."""
     if request.session_id not in sessions:
         raise HTTPException(
             status_code=404,
@@ -334,7 +326,7 @@ async def toggle_feature(request: FeatureToggleRequest):
         )
     
     chatbot = sessions[request.session_id]
-    print(f"Toggling feature '{request.feature}' to {'enabled' if request.enabled else 'disabled'} for session {request.session_id}")
+    
     if request.feature.lower() == "rag":
         chatbot.rag_enabled = request.enabled
         return {
@@ -351,10 +343,18 @@ async def toggle_feature(request: FeatureToggleRequest):
             "enabled": chatbot.web_search_enabled,
             "message": f"Web search {'enabled' if request.enabled else 'disabled'}"
         }
+    elif request.feature.lower() == "image":
+        chatbot.image_mode_enabled = request.enabled
+        return {
+            "success": True,
+            "feature": "image",
+            "enabled": chatbot.image_mode_enabled,
+            "message": f"Image mode {'enabled' if request.enabled else 'disabled'}"
+        }
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown feature: {request.feature}. Supported features: 'rag', 'websearch'"
+            detail=f"Unknown feature: {request.feature}. Supported features: 'rag', 'websearch', 'image'"
         )
 
 @app.post("/documents/upload", response_model=DocumentUploadResponse)
@@ -363,68 +363,74 @@ async def upload_document(
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None
 ):
-    """Upload a document to be processed."""
-    if session_id not in sessions:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Session {session_id} not found"
-        )
-    
-    try:
-        # Create session upload directory
-        session_dir = get_session_upload_dir(session_id)
-        
-        # Generate a unique filename to avoid overwrites
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_filename = ''.join(c if c.isalnum() or c in '._- ' else '_' for c in file.filename)
-        unique_filename = f"{timestamp}_{safe_filename}"
-        file_path = os.path.join(session_dir, unique_filename)
-        
-        # Save the file permanently
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Get file size
-        file_size = os.path.getsize(file_path)
-        
-        # Process the file in the background
-        chatbot = sessions[session_id]
-        document_result = chatbot.document_processor.process_document(file_path)
-        
-        # Return success with permanent file path
-        return DocumentUploadResponse(
-            success=True,
-            filename=file.filename,
-            message=f"Document processed successfully: {file.filename} ({file_size} bytes)",
-            path=file_path
-        )
-    except Exception as e:
-        logger.error(f"Error processing document: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing document: {str(e)}"
-        )
-
-@app.get("/documents/list/{session_id}", response_model=UploadedFileListResponse)
-async def list_session_files(session_id: str):
-    """List all files uploaded for a session."""
+    """Upload a document to add to the vector store."""
     if session_id not in sessions:
         raise HTTPException(
             status_code=404,
             detail=f"Session {session_id} not found"
         )
     
+    chatbot = sessions[session_id]
+    
+    # Create a temporary file to save the upload
+    temp_file_path = f"./temp_{file.filename}"
+    
     try:
-        files = get_session_files(session_id)
-        return UploadedFileListResponse(
-            session_id=session_id,
-            files=files
+        # Save the uploaded file
+        contents = await file.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(contents)
+        
+        # Process document using DocumentProcessor
+        document_processor = chatbot.document_processor
+        
+        # Detect file type
+        file_type = document_processor.detect_file_type(temp_file_path)
+        
+        # Extract content based on file type
+        content = ""
+        if file_type == "pdf":
+            content = document_processor._extract_from_pdf(temp_file_path)
+        elif file_type == "text":
+            content = document_processor._extract_from_text(temp_file_path)
+        elif file_type == "code":
+            content = document_processor._extract_from_code(temp_file_path)
+        elif file_type == "data":
+            content = document_processor._extract_from_data(temp_file_path)
+        elif file_type == "web":
+            content = document_processor._extract_from_web(temp_file_path)
+        else:
+            # Fallback for unknown file types
+            with open(temp_file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        
+        if not content:
+            return DocumentUploadResponse(
+                success=False,
+                filename=file.filename,
+                message=f"No content could be extracted from {file.filename}"
+            )
+        
+        # Add document to vector store
+        chatbot.vectorstore.add_document(content, source=file.filename)
+        
+        # Schedule cleanup in background
+        if background_tasks:
+            background_tasks.add_task(lambda: os.remove(temp_file_path) if os.path.exists(temp_file_path) else None)
+        
+        return DocumentUploadResponse(
+            success=True,
+            filename=file.filename,
+            message=f"Document successfully added to vector store"
         )
     except Exception as e:
-        logger.error(f"Error listing files: {str(e)}")
+        # Clean up temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
         raise HTTPException(
             status_code=500,
-            detail=f"Error listing files: {str(e)}"
+            detail=f"Error processing document: {str(e)}"
         )
 
 @app.post("/documents/process-list", response_model=dict)
@@ -476,119 +482,6 @@ async def process_document_list(
         raise HTTPException(
             status_code=500,
             detail=f"Error processing documents: {str(e)}"
-        )
-
-@app.post("/documents/analyze", response_model=FileAnalysisResponse)
-async def analyze_file(request: FileAnalysisRequest):
-    """Analyze a specific document."""
-    if request.session_id not in sessions:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session {request.session_id} not found"
-        )
-    
-    chatbot = sessions[request.session_id]
-    
-    try:
-        session_dir = get_session_upload_dir(request.session_id)
-        
-        # Find the file by filename (look for any file ending with the requested filename)
-        found_file = None
-        for file_path in os.listdir(session_dir):
-            if file_path.endswith(request.filename):
-                found_file = os.path.join(session_dir, file_path)
-                break
-        
-        if not found_file:
-            raise HTTPException(
-                status_code=404,
-                detail=f"File {request.filename} not found in session {request.session_id}"
-            )
-        
-        # Ensure document processor exists and has the right method
-        if not hasattr(chatbot, 'document_processor'):
-            logger.warning(f"Creating missing document_processor for session {request.session_id}")
-            from newclass import DocumentProcessor
-            chatbot.document_processor = DocumentProcessor(
-                vector_store=chatbot.vectorstore if hasattr(chatbot, 'vectorstore') else None
-            )
-        
-        # Check if the analyze_document method exists, if not use a fallback
-        if not hasattr(chatbot.document_processor, 'analyze_document'):
-            logger.error("analyze_document method not available, using fallback")
-            # Reload the module to ensure we have the latest version with analyze_document
-            import importlib
-            import sys
-            if 'newclass' in sys.modules:
-                importlib.reload(sys.modules['newclass'])
-                # Recreate the document processor
-                from newclass import DocumentProcessor
-                chatbot.document_processor = DocumentProcessor(
-                    vector_store=chatbot.vectorstore if hasattr(chatbot, 'vectorstore') else None
-                )
-            
-            # If still missing, use fallback
-            if not hasattr(chatbot.document_processor, 'analyze_document'):
-                file_size = os.path.getsize(found_file)
-                file_ext = os.path.splitext(found_file)[1].lower().replace('.', '') or 'unknown'
-                file_name = os.path.basename(found_file)
-                
-                # Create a basic analysis as fallback
-                analysis_result = (
-                    f"File Analysis:\n\n"
-                    f"File: {file_name}\n"
-                    f"Type: {file_ext.upper()}\n"
-                    f"Size: {file_size / 1024:.1f} KB\n\n"
-                    f"This file has been processed and indexed.\n"
-                    f"You can ask questions about the content in future messages."
-                )
-                
-                return FileAnalysisResponse(
-                    success=True,
-                    filename=request.filename,
-                    analysis=analysis_result,
-                    message=f"Successfully analyzed {request.filename} (basic analysis)"
-                )
-        
-        # Direct method call with explicit error handling
-        try:
-            analysis_result = chatbot.document_processor.analyze_document(found_file)
-            if not analysis_result:
-                raise ValueError("Analysis resulted in empty output")
-        except Exception as method_error:
-            logger.error(f"Error in analyze_document method: {str(method_error)}")
-            # Generate a fallback analysis
-            file_size = os.path.getsize(found_file)
-            file_ext = os.path.splitext(found_file)[1].lower().replace('.', '') or 'unknown'
-            file_name = os.path.basename(found_file)
-            
-            analysis_result = (
-                f"File Analysis (Fallback):\n\n"
-                f"File: {file_name}\n"
-                f"Type: {file_ext.upper()}\n"
-                f"Size: {file_size / 1024:.1f} KB\n\n"
-                f"This file has been processed and indexed.\n"
-                f"You can ask questions about the content in future messages.\n\n"
-                f"Note: Detailed analysis unavailable ({str(method_error)})"
-            )
-            
-        return FileAnalysisResponse(
-            success=True,
-            filename=request.filename,
-            analysis=analysis_result,
-            message=f"Successfully analyzed {request.filename}"
-        )
-        
-    except Exception as e:
-        # Enhanced error logging
-        import traceback
-        error_details = traceback.format_exc()
-        logger.error(f"Error analyzing document: {error_details}")
-        
-        # Return a more descriptive error
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error analyzing document: {str(e)}"
         )
 
 @app.get("/conversations", response_model=ConversationListResponse)
@@ -814,30 +707,74 @@ async def audio_chat(
             detail=f"Error processing audio chat: {str(e)}"
         )
 
-@app.post("/sessions/create", response_model=CreateSessionResponse)
-async def create_session(request: CreateSessionRequest):
-    """Create a new session without sending a message."""
-    # Create new session
-    new_session_id = str(uuid.uuid4())
-    sessions[new_session_id] = RagChatbot()
-    session_last_active[new_session_id] = datetime.now()
+@app.post("/images/upload", response_model=ImageUploadResponse)
+async def upload_image(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """Upload an image to process with the image model."""
+    if session_id not in sessions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session {session_id} not found"
+        )
     
-    # Apply settings if provided
-    if request.settings:
-        chatbot = sessions[new_session_id]
-        
-        if request.settings.rag_enabled is not None:
-            chatbot.rag_enabled = request.settings.rag_enabled
-            print(f"Set initial chatbot.rag_enabled to {chatbot.rag_enabled}")
-        
-        if request.settings.web_search_enabled is not None:
-            chatbot.web_search_enabled = request.settings.web_search_enabled
-            print(f"Set initial chatbot.web_search_enabled to {chatbot.web_search_enabled}")
+    chatbot = sessions[session_id]
     
-    return CreateSessionResponse(
-        session_id=new_session_id,
-        message="New session created successfully"
-    )
+    # Check if file is an image
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        return ImageUploadResponse(
+            success=False,
+            filename=file.filename,
+            message="Uploaded file is not a recognized image format",
+            error="Invalid file type"
+        )
+    
+    # Create a temporary file to save the upload
+    image_id = str(uuid.uuid4())
+    file_extension = os.path.splitext(file.filename)[1]
+    temp_file_path = f"./temp_image_{image_id}{file_extension}"
+    
+    try:
+        # Save the uploaded file
+        contents = await file.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(contents)
+        
+        # Process the image using the ImageProcessor
+        result = chatbot.process_image(temp_file_path, image_id)
+        
+        if not result["success"]:
+            return ImageUploadResponse(
+                success=False,
+                filename=file.filename,
+                message=f"Failed to process image: {result.get('error', 'Unknown error')}",
+                error=result.get("error")
+            )
+        
+        # Schedule cleanup in background (but keep image for the session)
+        # We don't want to delete the image as it's needed for future queries in image mode
+        
+        return ImageUploadResponse(
+            success=True,
+            image_id=image_id,
+            filename=file.filename,
+            description=result.get("description"),
+            message="Image successfully processed and added to conversation context"
+        )
+    except Exception as e:
+        # Clean up temp file on error
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        
+        return ImageUploadResponse(
+            success=False,
+            filename=file.filename,
+            message=f"Error processing image: {str(e)}",
+            error=str(e)
+        )
 
 # Error handlers
 @app.exception_handler(HTTPException)
