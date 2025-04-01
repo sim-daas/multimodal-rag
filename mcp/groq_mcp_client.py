@@ -29,12 +29,27 @@ async def main():
             resources = await session.list_resources()
             
             print("=== Available Tools ===")
+            # Fix: Tools are returned in a different format
             for tool in tools:
-                print(f"- {tool.name}: {tool.description}")
+                # Check the format of the tool and handle accordingly
+                if hasattr(tool, 'name'):
+                    print(f"- {tool.name}: {tool.description}")
+                elif isinstance(tool, tuple) and len(tool) >= 2:
+                    name, description = tool[0], tool[1]
+                    print(f"- {name}: {description}")
+                else:
+                    print(f"- {tool}")  # Fallback for other formats
             
             print("\n=== Available Resources ===")
+            # Same fix for resources
             for resource in resources:
-                print(f"- {resource.pattern}: {resource.description}")
+                if hasattr(resource, 'pattern'):
+                    print(f"- {resource.pattern}: {resource.description}")
+                elif isinstance(resource, tuple) and len(resource) >= 2:
+                    pattern, description = resource[0], resource[1]
+                    print(f"- {pattern}: {description}")
+                else:
+                    print(f"- {resource}")  # Fallback
             
             print("\n=== Chat with the Bot (type 'exit' to quit) ===")
             print("Type '/help' to see available commands\n")
